@@ -19,6 +19,7 @@
 using namespace std;
 using namespace chrono;
 
+// 循环队列buffer，相当于自动滑窗buffer
 typedef boost::circular_buffer<sensor_msgs::Imu> ImuCircularBuffer;
 
 class LidarMotionCalibrator
@@ -61,8 +62,10 @@ public:
       pcl_pub_origin_ = nh_.advertise<sensor_msgs::PointCloud2> ("/lidar_undistortion/origin", 10);
       laserscan_pub_ = nh_.advertise<sensor_msgs::LaserScan>("/lidar_undistortion/scan", 10);
 
+      // 激光采集发送到接收的延时，即传输延时
       delay_duration = ros::Duration(lidar_msg_delay_time_ / 1000.0);
 
+      // 开辟1.5s左右的缓存空间
       imuCircularBuffer_ = ImuCircularBuffer((int)(imu_frequency_ * 1.5));
     }
 
@@ -72,6 +75,7 @@ public:
 
     }
 
+    // imu 数据放入循环buffer中，相当于滑窗buffer
     void ImuCallback(const sensor_msgs::ImuConstPtr& _imu_msg)
     {
       imuCircularBuffer_.push_front(*_imu_msg);
@@ -95,9 +99,11 @@ public:
       // Change sensor_msgs::LaserScan format to PCL pointcloud format.
       LaserScanToPointCloud(_lidar_msg, pointcloud_raw_pcl);
 
+      // 记录当前的laser message
       current_laserscan_msg_ = _lidar_msg;
 
       // 保证imu buffer中有足够多的数据
+      // 确保已经接收了imu数据个数多到一帧laser 时间长度
       // Ensure that there is sufficient Imu data stored in imuCircularBuffer_.
       if (imuCircularBuffer_.size() > frame_duration.toSec() * imu_frequency_ * 1.5)
       {
@@ -108,24 +114,32 @@ public:
         pcl::PointCloud<pcl::PointXYZI> pointcloud_pcl;
         pcl::PointXYZI point_xyzi;
 
+        // buffer中imu数据最早时刻
         current_output_timestamp = imuCircularBuffer_[0].header.stamp;
+        // 最早的imu姿态
         Eigen::Quaternionf current_quat = ImuToCurrentQuaternion(imuCircularBuffer_[0].orientation);
 
+        // 遍历一帧激光点云中每个激光点
         for (int i = 0; i < length; i++)
         {
+          // 一个点的位置
           pcl::PointXYZI current_point = pointcloud_raw_pcl[i];
 
+          // 更改成eigen姿态表示
           Eigen::Vector3f point_in(current_point.x, current_point.y, 0.0);
 
+          // 当前点的采样时刻
           ros::Time point_timestamp = lidar_timebase + ros::Duration(_lidar_msg->time_increment * i);
 
           Eigen::Quaternionf point_quat;
 
-          // 如果成功获取当前扫描点的姿态
+          // 如果成功获取当前扫描点的姿态，如果获取成功，表明根据
           if (getLaserPose(i, point_timestamp, point_quat) == true)
           {
+            // 获取初始时刻imu航向与当前扫描点航向的转移矩阵
             Eigen::Quaternionf delta_quat = current_quat.inverse() * point_quat;
 
+            // 根据转移矩阵获取 修正当前点的位置
             Eigen::Vector3f point_out = delta_quat * point_in;
 
             point_xyzi.x = point_out(0);
@@ -140,10 +154,16 @@ public:
           }
         }
 
+        //以上完成了所有点的畸变矫正
+
+        // 有效距离值滤波
         ApplyRangeFilter(pointcloud_pcl);
+        // 有效角度值滤波
         ApplyAngleFilter(pointcloud_pcl);
+        // 离群点滤波
         ApplyRadiusOutlierFilter(pointcloud_pcl);
 
+        // 
         pcl::toROSMsg(pointcloud_pcl, pointcloud_msg);
         pointcloud_msg.header.frame_id = output_frame_id_;
         pcl_pub_.publish(pointcloud_msg);
@@ -192,16 +212,21 @@ public:
       {
         predict_orientation_flag = false;
         int i = 0;
+        // 遍历第一个点和在imu时刻对齐
         while (_timestamp < imuCircularBuffer_[i].header.stamp)
         {
           i++;
         }
+        // 首点点云对应前一个imu时刻
         index_front = i - 1;
+        // 首点点云对应后一个imu时刻
         index_back = i;
+        // 表明找到对应时刻的 imu data
         index_updated_flag = true;
       }
       else
       {
+        // 判断每个点 对应的imu时间戳
         while (predict_orientation_flag == false
                && _timestamp > imuCircularBuffer_[index_front].header.stamp
                && _timestamp > imuCircularBuffer_[index_back].header.stamp)
@@ -212,26 +237,33 @@ public:
           if (index_front < 0)
           {
             //use prediction
+            // 表明无更早期的imu数据产生
             predict_orientation_flag = true;
             index_front++;
             index_back++;
           }
-
+          // 表明找到对应时刻的 imu data
           index_updated_flag = true;
         }
       }
 
+      // 表明找到了对应的imu 帧数据
       if (index_updated_flag == true)
       {
         //cout << "index updated: " << index_front << " " << index_back << endl;
+        // 前imu时间戳
         timestamp_front = imuCircularBuffer_[index_front].header.stamp;
+        // 后一个时间戳
         timestamp_back = imuCircularBuffer_[index_back].header.stamp;
+        // 前时刻位姿态
         quat_front = Eigen::Quaternionf(imuCircularBuffer_[index_front].orientation.w, imuCircularBuffer_[index_front].orientation.x, imuCircularBuffer_[index_front].orientation.y, imuCircularBuffer_[index_front].orientation.z);
+        // 后时刻位姿
         quat_back = Eigen::Quaternionf(imuCircularBuffer_[index_back].orientation.w, imuCircularBuffer_[index_back].orientation.x, imuCircularBuffer_[index_back].orientation.y, imuCircularBuffer_[index_back].orientation.z);
 
         index_updated_flag = false;
       }
 
+      // 计算时间差
       float alpha = (float)(_timestamp.toNSec() - timestamp_back.toNSec()) / (timestamp_front.toNSec() - timestamp_back.toNSec());
 
       if (alpha < 0)
@@ -239,7 +271,7 @@ public:
         return false;
       }
 
-      // 球面线性插值
+      // 球面线性插值，求出当前点位姿态
       // Slerp.
       quat_out = quat_back.slerp(alpha, quat_front);
 
@@ -279,6 +311,7 @@ public:
       }
     }
 
+    // 将3维姿态转换为水平方向姿态 的四元数
     Eigen::Quaternionf ImuToCurrentQuaternion(geometry_msgs::Quaternion _quat)
     {
       tf::Quaternion current_tf_quat(_quat.x, _quat.y, _quat.z, _quat.w);
@@ -358,6 +391,7 @@ public:
       laserscan_pub_.publish(output);
     }
 
+    // 点云根据有效距离滤波
     void ApplyRangeFilter(pcl::PointCloud<pcl::PointXYZI>& _input)
     {
       if (use_range_filter_ == true)
@@ -375,6 +409,7 @@ public:
       }
     }
 
+    // 有效角度滤波
     void ApplyAngleFilter(pcl::PointCloud<pcl::PointXYZI>& _input)
     {
       if (use_angle_filter_ == true)
@@ -392,6 +427,7 @@ public:
       }
     }
 
+    // 离群点滤波
     void ApplyRadiusOutlierFilter(pcl::PointCloud<pcl::PointXYZI>& _input)
     {
       if (use_radius_outlier_filter_ == true)
